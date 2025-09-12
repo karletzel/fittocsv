@@ -32,10 +32,11 @@ def convert_fit_to_csv(fit_file_path, csv_file_path):
                writer.writerow(data.values())   
 
 
-fit_file_path = 'C:\\Users\\kretz\\Documents\\pythonwork\\TP-10-24-13-32-27-490.FIT'
-csv_file_path = 'C:\\Users\\kretz\\Documents\\pythonwork\\output_4_CSV.csv'
+fit_file_path = 'C:\\Users\\kretz\\Documents\\pythonwork\\files\\tp-523890_20250912.FIT'
+csv_file_path = 'C:\\Users\\kretz\\Documents\\pythonwork\\output_5_CSV.csv'
 #fit_file_path = 'C:\\Users\\kretz\\Documents\\pythonwork\\TP10-22-16-27-16-835.FIT'
 #csv_file_path = 'C:\\Users\\kretz\\Documents\\pythonwork\\output_Three_CSV.csv'
 #fit_file_path = 'C:\\Users\\kretz\\Documents\\pythonwork\\TP10-31-13-56-25-487.FIT'
 #csv_file_path = 'C:\\Users\\kretz\\Documents\\pythonwork\\output_TWO_CSV.csv'
 convert_fit_to_csv(fit_file_path, csv_file_path)
+
