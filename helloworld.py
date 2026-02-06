@@ -25,11 +25,11 @@ def convert_fit_to_csv(fit_file_path, csv_file_path):
         for message in fit_file.get_messages('record'):  #Loop through messages in file     
                for i in range(len(column_list)): #Loop through total number of records 
                     for record_data in message:
-                           if record_data.name == column_list[i] and record_data.units:
-                             data[record_data.name] = "{} {}".format(record_data.value, record_data.units)
-                             #print("Recordata:",record_data.name, column_list[i], data[record_data.name])
-                           elif record_data.name == column_list[i]:
+                           if record_data.name == column_list[i]: # and record_data.units:
                              data[record_data.name] = record_data.value
+                             #print("Recordata:",record_data.name, column_list[i], data[record_data.name])
+                           #elif record_data.name == column_list[i]:
+                            # data[record_data.name] = record_data.value
                writer.writerow(data.values())   
 
 def process_folder(folder_path):
