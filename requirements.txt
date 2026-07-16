@@ -4,4 +4,4 @@ google-cloud-storage==2.18.0
 fitparse==1.2.0
 pandas==2.2.0
 pyarrow==17.0.0
-setuptools==70.0.0
+# setuptools==70.0.0
