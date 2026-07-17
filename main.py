@@ -47,3 +47,5 @@ def process_fit_file(cloud_event: CloudEvent):
     processed_blob.upload_from_filename(f"/tmp/{output_filename}")
     
     print(f"Successfully processed and uploaded: {processed_blob.name}")
+
+print("Function is done, let's hope it worked!...")
