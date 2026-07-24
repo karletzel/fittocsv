@@ -40,6 +40,10 @@ def process_fit_file(cloud_event: CloudEvent):
     
     # 3. Save as Parquet (optimized for analytics)
     output_filename = file_name.replace('.fit', '.parquet')
+    # Cast left_right_balance to string to prevent PyArrow schema mismatch with mixed types
+    if 'left_right_balance' in df.columns:
+            df['left_right_balance'] = df['left_right_balance'].astype(str)
+    
     df.to_parquet(f"/tmp/{output_filename}")
     
     # 4. Upload to a 'processed' folder in the same bucket
