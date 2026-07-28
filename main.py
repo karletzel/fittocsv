@@ -3,6 +3,7 @@
 
 import os
 import io
+import re
 import fitparse
 import pandas as pd
 import functions_framework
@@ -19,7 +20,7 @@ def process_fit_file(cloud_event: CloudEvent):
     file_name = data["name"]
     
     # Only process .fit files
-    if not file_name.endswith('.fit'):
+    if not (file_name.endswith('.fit') OR file_name.endswith('.FIT')):
         print(f"Skipping non-fit file: {file_name}")
         return
 
@@ -39,7 +40,11 @@ def process_fit_file(cloud_event: CloudEvent):
     df = pd.DataFrame(records)
     
     # 3. Save as Parquet (optimized for analytics)
-    output_filename = file_name.replace('.fit', '.parquet')
+
+    # This will replace .fit, .FIT, .Fit, etc., with .parquet
+    output_filename = re.sub(r'\.fit$', '.parquet', file_name, flags=re.IGNORECASE)
+
+    # output_filename = file_name.replace('.fit', '.parquet')
     # Cast left_right_balance to string to prevent PyArrow schema mismatch with mixed types
     if 'left_right_balance' in df.columns:
             df['left_right_balance'] = df['left_right_balance'].astype(str)
