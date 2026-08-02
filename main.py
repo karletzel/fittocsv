@@ -20,7 +20,7 @@ def process_fit_file(cloud_event: CloudEvent):
     file_name = data["name"]
     
     # Only process .fit files
-    if not file_name.endswith('.fit', '.FIT'):
+    if not file_name.endswith(('.fit', '.FIT')):
         print(f"Skipping non-fit file: {file_name}")
         return
 
