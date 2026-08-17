@@ -1,17 +1,36 @@
 # def process_fit_file(cloud_event):
 #    print("Function is super live! Waiting for FIT file...")
 
-import os
 import io
 import re
+from decimal import Decimal
+from numbers import Real
+
 import fitparse
 import pandas as pd
 import functions_framework
 from google.cloud import storage
 from cloudevents.http import CloudEvent
 
-# Initialize GCS client
-storage_client = storage.Client()
+# FIT may decode the same numeric field as an ``int`` or a ``float`` depending
+# on the scale used by the device.  Using one canonical Python type here keeps
+# the resulting Parquet schema stable from file to file.
+def normalize_fit_value(value):
+    """Return a value with a stable type suitable for a Parquet column."""
+    if value is None or isinstance(value, bool):
+        return value
+    if isinstance(value, (Real, Decimal)):
+        return float(value)
+    return value
+
+
+def extract_record(record):
+    """Extract a FIT record while normalizing every numeric field."""
+    return {
+        field.name: normalize_fit_value(field.value)
+        for field in record
+    }
+
 
 @functions_framework.cloud_event
 def process_fit_file(cloud_event: CloudEvent):
@@ -27,15 +46,14 @@ def process_fit_file(cloud_event: CloudEvent):
     print(f"Processing: {file_name}")
 
     # 1. Download the file from GCS
+    storage_client = storage.Client()
     bucket = storage_client.bucket(bucket_name)
     blob = bucket.blob(file_name)
     file_content = blob.download_as_bytes()
     
     # 2. Parse the FIT file
     fitfile = fitparse.FitFile(io.BytesIO(file_content))
-    records = []
-    for record in fitfile.get_messages('record'):
-        records.append({data.name: data.value for data in record})
+    records = [extract_record(record) for record in fitfile.get_messages('record')]
     
     df = pd.DataFrame(records)
     
