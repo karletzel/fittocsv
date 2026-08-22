@@ -1,9 +1,13 @@
 import unittest
 from datetime import datetime, timezone
 from decimal import Decimal
+from io import BytesIO
 from types import SimpleNamespace
 
-from main import extract_record, normalize_fit_value
+import pandas as pd
+import pyarrow.parquet as pq
+
+from main import enforce_field_dtypes, extract_record, normalize_fit_value
 
 
 class NormalizeFitValueTest(unittest.TestCase):
@@ -34,6 +38,20 @@ class NormalizeFitValueTest(unittest.TestCase):
         )
         self.assertIsInstance(extracted["power"], float)
         self.assertIsInstance(extracted["speed"], float)
+
+    def test_heart_rate_has_double_parquet_type_for_integer_input(self):
+        df = enforce_field_dtypes(pd.DataFrame({"heart_rate": [120, 121]}))
+        parquet = BytesIO()
+
+        df.to_parquet(parquet, index=False)
+
+        self.assertEqual(str(df.dtypes["heart_rate"]), "float64")
+        self.assertEqual(str(pq.read_schema(parquet).field("heart_rate").type), "double")
+
+    def test_heart_rate_has_float_type_when_all_values_are_null(self):
+        df = enforce_field_dtypes(pd.DataFrame({"heart_rate": [None, None]}))
+
+        self.assertEqual(str(df.dtypes["heart_rate"]), "float64")
 
 
 if __name__ == "__main__":

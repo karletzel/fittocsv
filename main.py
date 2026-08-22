@@ -12,6 +12,14 @@ import functions_framework
 from google.cloud import storage
 from cloudevents.http import CloudEvent
 
+# Fields in this mapping are cast after DataFrame construction as well as during
+# extraction.  The explicit cast matters when a file contains only null values
+# for a field, because pandas cannot infer a numeric dtype from those values.
+FIELD_DTYPES = {
+    "heart_rate": "float64",
+}
+
+
 # FIT may decode the same numeric field as an ``int`` or a ``float`` depending
 # on the scale used by the device.  Using one canonical Python type here keeps
 # the resulting Parquet schema stable from file to file.
@@ -30,6 +38,14 @@ def extract_record(record):
         field.name: normalize_fit_value(field.value)
         for field in record
     }
+
+
+def enforce_field_dtypes(df):
+    """Apply canonical dtypes that must be identical in every output file."""
+    for field_name, dtype in FIELD_DTYPES.items():
+        if field_name in df.columns:
+            df[field_name] = pd.to_numeric(df[field_name], errors="coerce").astype(dtype)
+    return df
 
 
 @functions_framework.cloud_event
@@ -55,7 +71,7 @@ def process_fit_file(cloud_event: CloudEvent):
     fitfile = fitparse.FitFile(io.BytesIO(file_content))
     records = [extract_record(record) for record in fitfile.get_messages('record')]
     
-    df = pd.DataFrame(records)
+    df = enforce_field_dtypes(pd.DataFrame(records))
     
     # 3. Save as Parquet (optimized for analytics)
 
