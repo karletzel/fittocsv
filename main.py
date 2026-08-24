@@ -1,28 +1,75 @@
-# def process_fit_file(cloud_event):
-#    print("Function is super live! Waiting for FIT file...")
-
+import hashlib
 import io
+import os
 import re
 from decimal import Decimal
 from numbers import Real
 
 import fitparse
-import pandas as pd
 import functions_framework
-from google.cloud import storage
+import pandas as pd
 from cloudevents.http import CloudEvent
+from google.cloud import storage
 
-# Fields in this mapping are cast after DataFrame construction as well as during
-# extraction.  The explicit cast matters when a file contains only null values
-# for a field, because pandas cannot infer a numeric dtype from those values.
+
 FIELD_DTYPES = {
     "heart_rate": "float64",
 }
 
+# A fixed schema prevents different kinds of workouts from producing incompatible
+# Parquet schemas when some FIT fields are absent.
+METADATA_DTYPES = {
+    "workout_id": "string",
+    "source_bucket": "string",
+    "source_file": "string",
+    "sport": "string",
+    "sub_sport": "string",
+    "start_time": "datetime64[ns, UTC]",
+    "end_time": "datetime64[ns, UTC]",
+    "total_elapsed_time": "float64",
+    "total_timer_time": "float64",
+    "total_distance": "float64",
+    "total_calories": "float64",
+    "avg_heart_rate": "float64",
+    "max_heart_rate": "float64",
+    "avg_speed": "float64",
+    "max_speed": "float64",
+    "total_ascent": "float64",
+    "total_descent": "float64",
+    "avg_cadence": "float64",
+    "max_cadence": "float64",
+    "avg_power": "float64",
+    "max_power": "float64",
+    "normalized_power": "float64",
+    "training_stress_score": "float64",
+    "intensity_factor": "float64",
+    "avg_temperature": "float64",
+    "min_temperature": "float64",
+    "max_temperature": "float64",
+    "manufacturer": "string",
+    "product": "string",
+    "serial_number": "string",
+    "device_created_at": "datetime64[ns, UTC]",
+}
 
-# FIT may decode the same numeric field as an ``int`` or a ``float`` depending
-# on the scale used by the device.  Using one canonical Python type here keeps
-# the resulting Parquet schema stable from file to file.
+SESSION_FIELDS = tuple(
+    name
+    for name in METADATA_DTYPES
+    if name
+    not in {
+        "workout_id",
+        "source_bucket",
+        "source_file",
+        "end_time",
+        "min_temperature",
+        "manufacturer",
+        "product",
+        "serial_number",
+        "device_created_at",
+    }
+)
+
+
 def normalize_fit_value(value):
     """Return a value with a stable type suitable for a Parquet column."""
     if value is None or isinstance(value, bool):
@@ -33,11 +80,8 @@ def normalize_fit_value(value):
 
 
 def extract_record(record):
-    """Extract a FIT record while normalizing every numeric field."""
-    return {
-        field.name: normalize_fit_value(field.value)
-        for field in record
-    }
+    """Extract a FIT message while normalizing every numeric field."""
+    return {field.name: normalize_fit_value(field.value) for field in record}
 
 
 def enforce_field_dtypes(df):
@@ -48,47 +92,111 @@ def enforce_field_dtypes(df):
     return df
 
 
+def workout_id_for(bucket_name, file_name):
+    """Return a stable join key for all outputs produced from a GCS object."""
+    identity = f"gs://{bucket_name}/{file_name}".encode("utf-8")
+    return hashlib.sha256(identity).hexdigest()
+
+
+def first_message(fitfile, message_name):
+    """Return the first decoded FIT message of a given type as a dictionary."""
+    return next(
+        (extract_record(message) for message in fitfile.get_messages(message_name)),
+        {},
+    )
+
+
+def build_workout_metadata(fitfile, records, bucket_name, file_name, workout_id):
+    """Build a single, consistently typed row describing a workout."""
+    session = first_message(fitfile, "session")
+    file_id = first_message(fitfile, "file_id")
+    metadata = {column: None for column in METADATA_DTYPES}
+    metadata.update(
+        workout_id=workout_id,
+        source_bucket=bucket_name,
+        source_file=file_name,
+    )
+
+    for field_name in SESSION_FIELDS:
+        metadata[field_name] = session.get(field_name)
+
+    metadata["end_time"] = session.get("timestamp")
+    metadata["manufacturer"] = file_id.get("manufacturer")
+    metadata["product"] = file_id.get("product_name", file_id.get("product"))
+    metadata["serial_number"] = file_id.get("serial_number")
+    metadata["device_created_at"] = file_id.get("time_created")
+
+    temperatures = [
+        record["temperature"]
+        for record in records
+        if isinstance(record.get("temperature"), Real)
+    ]
+    if temperatures:
+        if metadata["avg_temperature"] is None:
+            metadata["avg_temperature"] = sum(temperatures) / len(temperatures)
+        metadata["min_temperature"] = min(temperatures)
+        if metadata["max_temperature"] is None:
+            metadata["max_temperature"] = max(temperatures)
+
+    df = pd.DataFrame([metadata])
+    for field_name, dtype in METADATA_DTYPES.items():
+        if dtype.startswith("datetime64"):
+            df[field_name] = pd.to_datetime(
+                df[field_name], errors="coerce", utc=True
+            ).astype(dtype)
+        elif dtype == "float64":
+            df[field_name] = pd.to_numeric(df[field_name], errors="coerce").astype(dtype)
+        else:
+            df[field_name] = df[field_name].astype(dtype)
+    return df
+
+
+def parquet_output_name(file_name):
+    return re.sub(r"\.fit$", ".parquet", file_name, flags=re.IGNORECASE)
+
+
 @functions_framework.cloud_event
 def process_fit_file(cloud_event: CloudEvent):
     data = cloud_event.data
     bucket_name = data["bucket"]
     file_name = data["name"]
-    
-    # Only process .fit files
-    if not file_name.endswith(('.fit', '.FIT')):
+
+    if not file_name.lower().endswith(".fit"):
         print(f"Skipping non-fit file: {file_name}")
         return
 
     print(f"Processing: {file_name}")
-
-    # 1. Download the file from GCS
     storage_client = storage.Client()
     bucket = storage_client.bucket(bucket_name)
-    blob = bucket.blob(file_name)
-    file_content = blob.download_as_bytes()
-    
-    # 2. Parse the FIT file
+    file_content = bucket.blob(file_name).download_as_bytes()
+
     fitfile = fitparse.FitFile(io.BytesIO(file_content))
-    records = [extract_record(record) for record in fitfile.get_messages('record')]
-    
-    df = enforce_field_dtypes(pd.DataFrame(records))
-    
-    # 3. Save as Parquet (optimized for analytics)
+    records = [extract_record(record) for record in fitfile.get_messages("record")]
+    workout_id = workout_id_for(bucket_name, file_name)
 
-    # This will replace .fit, .FIT, .Fit, etc., with .parquet
-    output_filename = re.sub(r'\.fit$', '.parquet', file_name, flags=re.IGNORECASE)
+    records_df = enforce_field_dtypes(pd.DataFrame(records))
+    records_df.insert(0, "workout_id", workout_id)
+    records_df.insert(1, "source_file", file_name)
+    if "left_right_balance" in records_df.columns:
+        records_df["left_right_balance"] = records_df["left_right_balance"].astype(str)
 
-    # output_filename = file_name.replace('.fit', '.parquet')
-    # Cast left_right_balance to string to prevent PyArrow schema mismatch with mixed types
-    if 'left_right_balance' in df.columns:
-            df['left_right_balance'] = df['left_right_balance'].astype(str)
-    
-    df.to_parquet(f"/tmp/{output_filename}")
-    
-    # 4. Upload to a 'processed' folder in the same bucket
-    processed_blob = bucket.blob(f"processed/{output_filename}")
-    processed_blob.upload_from_filename(f"/tmp/{output_filename}")
-    
-    print(f"Successfully processed and uploaded: {processed_blob.name}")
+    metadata_df = build_workout_metadata(
+        fitfile, records, bucket_name, file_name, workout_id
+    )
+    output_filename = parquet_output_name(file_name)
+    local_data_path = os.path.join("/tmp", os.path.basename(output_filename))
+    local_metadata_path = os.path.join("/tmp", f"metadata-{os.path.basename(output_filename)}")
+    records_df.to_parquet(local_data_path, index=False)
+    metadata_df.to_parquet(local_metadata_path, index=False)
+
+    data_blob = bucket.blob(f"processed/data/{output_filename}")
+    metadata_blob = bucket.blob(f"processed/metadata/{output_filename}")
+    data_blob.upload_from_filename(local_data_path)
+    metadata_blob.upload_from_filename(local_metadata_path)
+
+    print(f"Successfully uploaded records: {data_blob.name}")
+    print(f"Successfully uploaded metadata: {metadata_blob.name}")
+
 
 print("Function is done, let's hope it worked!...")
+
