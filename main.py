@@ -108,7 +108,11 @@ def first_message(fitfile, message_name):
 
 def build_workout_metadata(fitfile, records, bucket_name, file_name, workout_id):
     """Build a single, consistently typed row describing a workout."""
-    session = first_message(fitfile, "session")
+    sessions = [
+        extract_record(message) for message in fitfile.get_messages("session")
+    ]
+    print(f"FIT sessions for {file_name}: {sessions}")
+    session = sessions[0] if sessions else {}
     file_id = first_message(fitfile, "file_id")
     metadata = {column: None for column in METADATA_DTYPES}
     metadata.update(
