@@ -92,6 +92,28 @@ def enforce_field_dtypes(df):
     return df
 
 
+def build_records_dataframe(records, file_name, workout_id):
+    """Build the record-level time series written to processed/data."""
+    if not records:
+        raise ValueError(f"No FIT record messages found in {file_name}")
+
+    records_df = enforce_field_dtypes(pd.DataFrame(records))
+    if "timestamp" not in records_df.columns or records_df["timestamp"].isna().all():
+        raise ValueError(f"FIT record messages have no timestamps in {file_name}")
+
+    records_df["timestamp"] = pd.to_datetime(
+        records_df["timestamp"], errors="coerce", utc=True
+    )
+    if records_df["timestamp"].isna().all():
+        raise ValueError(f"FIT record timestamps could not be decoded in {file_name}")
+
+    records_df.insert(0, "workout_id", workout_id)
+    records_df.insert(1, "source_file", file_name)
+    if "left_right_balance" in records_df.columns:
+        records_df["left_right_balance"] = records_df["left_right_balance"].astype(str)
+    return records_df
+
+
 def workout_id_for(bucket_name, file_name):
     """Return a stable join key for all outputs produced from a GCS object."""
     identity = f"gs://{bucket_name}/{file_name}".encode("utf-8")
@@ -178,11 +200,11 @@ def process_fit_file(cloud_event: CloudEvent):
     records = [extract_record(record) for record in fitfile.get_messages("record")]
     workout_id = workout_id_for(bucket_name, file_name)
 
-    records_df = enforce_field_dtypes(pd.DataFrame(records))
-    records_df.insert(0, "workout_id", workout_id)
-    records_df.insert(1, "source_file", file_name)
-    if "left_right_balance" in records_df.columns:
-        records_df["left_right_balance"] = records_df["left_right_balance"].astype(str)
+    records_df = build_records_dataframe(records, file_name, workout_id)
+    print(
+        f"Extracted {len(records_df)} time-series records for {file_name}; "
+        f"columns: {list(records_df.columns)}"
+    )
 
     metadata_df = build_workout_metadata(
         fitfile, records, bucket_name, file_name, workout_id

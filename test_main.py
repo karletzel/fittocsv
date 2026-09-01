@@ -9,6 +9,7 @@ import pyarrow.parquet as pq
 
 from main import (
     build_workout_metadata,
+    build_records_dataframe,
     enforce_field_dtypes,
     extract_record,
     normalize_fit_value,
@@ -30,6 +31,33 @@ def message(**values):
 
 
 class FitExtractionTest(unittest.TestCase):
+    def test_records_dataframe_preserves_time_series_rows(self):
+        first = datetime(2026, 8, 15, 10, tzinfo=timezone.utc)
+        second = datetime(2026, 8, 15, 10, 0, 1, tzinfo=timezone.utc)
+        records = [
+            {"timestamp": first, "heart_rate": 120.0, "power": 200.0},
+            {"timestamp": second, "heart_rate": 121.0, "power": 210.0},
+        ]
+
+        df = build_records_dataframe(records, "incoming/run.fit", "workout-1")
+
+        self.assertEqual(len(df), 2)
+        self.assertEqual(df["timestamp"].tolist(), [first, second])
+        self.assertEqual(df["power"].tolist(), [200.0, 210.0])
+        self.assertTrue((df["workout_id"] == "workout-1").all())
+        parquet = BytesIO()
+        df.to_parquet(parquet, index=False)
+        round_trip = pd.read_parquet(parquet)
+        self.assertEqual(len(round_trip), 2)
+        self.assertIn("timestamp", round_trip.columns)
+        self.assertIn("power", round_trip.columns)
+
+    def test_records_dataframe_rejects_missing_time_series(self):
+        with self.assertRaisesRegex(ValueError, "No FIT record messages"):
+            build_records_dataframe([], "incoming/run.fit", "workout-1")
+        with self.assertRaisesRegex(ValueError, "no timestamps"):
+            build_records_dataframe([{"heart_rate": 120.0}], "incoming/run.fit", "workout-1")
+
     def test_numeric_values_always_become_float(self):
         self.assertIsInstance(normalize_fit_value(12), float)
         self.assertIsInstance(normalize_fit_value(12.5), float)
