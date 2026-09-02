@@ -1,4 +1,6 @@
 import unittest
+import os
+import tempfile
 from datetime import datetime, timezone
 from decimal import Decimal
 from io import BytesIO
@@ -14,6 +16,7 @@ from main import (
     extract_record,
     normalize_fit_value,
     parquet_output_name,
+    verify_data_parquet,
     workout_id_for,
 )
 
@@ -57,6 +60,17 @@ class FitExtractionTest(unittest.TestCase):
             build_records_dataframe([], "incoming/run.fit", "workout-1")
         with self.assertRaisesRegex(ValueError, "no timestamps"):
             build_records_dataframe([{"heart_rate": 120.0}], "incoming/run.fit", "workout-1")
+
+    def test_verify_data_parquet_checks_round_trip_row_count(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            parquet_file = os.path.join(temp_dir, "records.parquet")
+            pd.DataFrame({"timestamp": [1, 2], "power": [200, 210]}).to_parquet(
+                parquet_file, index=False
+            )
+            verified = verify_data_parquet(parquet_file, 2)
+            self.assertEqual(len(verified), 2)
+            with self.assertRaisesRegex(ValueError, "row count does not match"):
+                verify_data_parquet(parquet_file, 3)
 
     def test_numeric_values_always_become_float(self):
         self.assertIsInstance(normalize_fit_value(12), float)

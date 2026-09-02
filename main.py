@@ -181,6 +181,25 @@ def parquet_output_name(file_name):
     return re.sub(r"\.fit$", ".parquet", file_name, flags=re.IGNORECASE)
 
 
+def verify_data_parquet(local_data_path, expected_rows):
+    """Read the data Parquet back and fail before upload if rows were lost."""
+    parquet_df = pd.read_parquet(local_data_path)
+    actual_rows = len(parquet_df)
+    print("Parquet verification path:", local_data_path)
+    print("Parquet verification rows:", actual_rows)
+    print("Parquet verification columns:", list(parquet_df.columns))
+    print("Parquet verification dtypes:", parquet_df.dtypes.astype(str).to_dict())
+    print("Parquet first 3 time-series rows:\n", parquet_df.head(3).to_string(index=False))
+    if actual_rows != expected_rows:
+        raise ValueError(
+            "Parquet row count does not match extracted FIT records: "
+            + str(actual_rows)
+            + " != "
+            + str(expected_rows)
+        )
+    return parquet_df
+
+
 @functions_framework.cloud_event
 def process_fit_file(cloud_event: CloudEvent):
     data = cloud_event.data
@@ -188,23 +207,27 @@ def process_fit_file(cloud_event: CloudEvent):
     file_name = data["name"]
 
     if not file_name.lower().endswith(".fit"):
-        print(f"Skipping non-fit file: {file_name}")
+        print("Skipping non-fit file:", file_name)
         return
 
-    print(f"Processing: {file_name}")
+    print("Source bucket:", bucket_name)
+    print("Source FIT object:", file_name)
     storage_client = storage.Client()
     bucket = storage_client.bucket(bucket_name)
     file_content = bucket.blob(file_name).download_as_bytes()
+    print("Downloaded FIT bytes:", len(file_content))
 
     fitfile = fitparse.FitFile(io.BytesIO(file_content))
     records = [extract_record(record) for record in fitfile.get_messages("record")]
     workout_id = workout_id_for(bucket_name, file_name)
 
     records_df = build_records_dataframe(records, file_name, workout_id)
-    print(
-        f"Extracted {len(records_df)} time-series records for {file_name}; "
-        f"columns: {list(records_df.columns)}"
-    )
+    print("Extracted FIT record messages:", len(records))
+    print("Time-series DataFrame rows:", len(records_df))
+    print("Time-series columns:", list(records_df.columns))
+    print("Non-null values per column:", records_df.notna().sum().to_dict())
+    print("First timestamp:", records_df["timestamp"].min())
+    print("Last timestamp:", records_df["timestamp"].max())
 
     metadata_df = build_workout_metadata(
         fitfile, records, bucket_name, file_name, workout_id
@@ -214,15 +237,16 @@ def process_fit_file(cloud_event: CloudEvent):
     local_metadata_path = os.path.join("/tmp", f"metadata-{os.path.basename(output_filename)}")
     records_df.to_parquet(local_data_path, index=False)
     metadata_df.to_parquet(local_metadata_path, index=False)
+    print("Local data Parquet bytes:", os.path.getsize(local_data_path))
+    verify_data_parquet(local_data_path, len(records_df))
 
     data_blob = bucket.blob(f"processed/data/{output_filename}")
     metadata_blob = bucket.blob(f"processed/metadata/{output_filename}")
+    print("Uploading time-series Parquet to:", data_blob.name)
+    print("Uploading one-row metadata Parquet to:", metadata_blob.name)
     data_blob.upload_from_filename(local_data_path)
     metadata_blob.upload_from_filename(local_metadata_path)
 
-    print(f"Successfully uploaded records: {data_blob.name}")
-    print(f"Successfully uploaded metadata: {metadata_blob.name}")
-
-
-print("Function is done, let's hope it worked!...")
+    print("Successfully uploaded time-series records:", data_blob.name)
+    print("Successfully uploaded workout metadata:", metadata_blob.name)
 
