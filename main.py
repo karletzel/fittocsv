@@ -203,8 +203,40 @@ def verify_data_parquet(local_data_path, expected_rows):
 @functions_framework.cloud_event
 def process_fit_file(cloud_event: CloudEvent):
     data = cloud_event.data
-    bucket_name = data["bucket"]
-    file_name = data["name"]
+    if not isinstance(data, dict):
+        print("Skipping malformed event: data must be a dictionary")
+        return
+
+    if "message" in data:
+        message = data["message"]
+        attributes = message.get("attributes") if isinstance(message, dict) else None
+        if not isinstance(attributes, dict):
+            print("Skipping malformed Pub/Sub event: missing message attributes")
+            return
+        bucket_name = attributes.get("bucketId")
+        file_name = attributes.get("objectId")
+        event_type = attributes.get("eventType")
+    else:
+        bucket_name = data.get("bucket")
+        file_name = data.get("name")
+        event_type = data.get("eventType")
+
+    if event_type is not None and event_type != "OBJECT_FINALIZE":
+        print("Skipping event type:", event_type)
+        return
+
+    if (
+        not isinstance(bucket_name, str)
+        or not bucket_name.strip()
+        or not isinstance(file_name, str)
+        or not file_name.strip()
+    ):
+        print("Skipping malformed event: bucket and filename must be present strings")
+        return
+
+    if "/" in file_name:
+        print("Skipping object outside bucket root:", file_name)
+        return
 
     if not file_name.lower().endswith(".fit"):
         print("Skipping non-fit file:", file_name)

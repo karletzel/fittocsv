@@ -5,9 +5,11 @@ from datetime import datetime, timezone
 from decimal import Decimal
 from io import BytesIO
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import pandas as pd
 import pyarrow.parquet as pq
+from cloudevents.http import CloudEvent
 
 from main import (
     build_workout_metadata,
@@ -16,6 +18,7 @@ from main import (
     extract_record,
     normalize_fit_value,
     parquet_output_name,
+    process_fit_file,
     verify_data_parquet,
     workout_id_for,
 )
@@ -31,6 +34,72 @@ class FakeFitFile:
 
 def message(**values):
     return [SimpleNamespace(name=name, value=value) for name, value in values.items()]
+
+
+class EventHandlerTest(unittest.TestCase):
+    @staticmethod
+    def event(data):
+        return CloudEvent({"type": "test.event", "source": "test"}, data)
+
+    @staticmethod
+    def pubsub(bucket="user-bucket", name="RUN.FIT", **attributes):
+        return {"message": {"attributes": {
+            "bucketId": bucket, "objectId": name,
+            "eventType": "OBJECT_FINALIZE", "objectGeneration": "123",
+            **attributes,
+        }, "data": "payload does not need base64 decoding"}}
+
+    def test_root_fit_files_process_and_upload_to_originating_bucket(self):
+        for data in (
+            {"bucket": "user-bucket", "name": "run.fit"},
+            {"bucket": "user-bucket", "name": "RUN.FIT", "eventType": "OBJECT_FINALIZE"},
+            self.pubsub(),
+            self.pubsub(eventType=None),
+            {"message": {"attributes": {"bucketId": "user-bucket", "objectId": "RUN.FIT"}}},
+        ):
+            with self.subTest(data=data), patch("main.storage.Client") as client, \
+                    patch("main.fitparse.FitFile") as parser, \
+                    patch("main.pd.DataFrame.to_parquet"), \
+                    patch("main.os.path.getsize", return_value=100), \
+                    patch("main.verify_data_parquet"), patch("builtins.print"):
+                bucket = client.return_value.bucket.return_value
+                bucket.blob.return_value.download_as_bytes.return_value = b"fit bytes"
+                parser.return_value = FakeFitFile({"record": [message(
+                    timestamp=datetime(2026, 8, 15, tzinfo=timezone.utc), heart_rate=120,
+                )]})
+
+                process_fit_file(self.event(data))
+
+                name = data.get("name", "RUN.FIT")
+                output = parquet_output_name(name)
+                client.return_value.bucket.assert_called_once_with("user-bucket")
+                self.assertEqual(
+                    [call.args[0] for call in bucket.blob.call_args_list],
+                    [name, f"processed/data/{output}", f"processed/metadata/{output}"],
+                )
+                self.assertEqual(bucket.blob.return_value.upload_from_filename.call_count, 2)
+
+    def test_irrelevant_and_malformed_events_skip_processing(self):
+        cases = [None, [], {}, {"bucket": "user-bucket"}, {"name": "run.fit"},
+                 {"message": None}, {"message": []},
+                 {"message": {}}, {"message": {"attributes": []}},
+                 {"message": {"attributes": {}}}]
+        for name in ("folder/run.fit", "processed/data/run.fit", "run.parquet", "run.txt"):
+            cases.extend([{"bucket": "user-bucket", "name": name}, self.pubsub(name=name)])
+        for bucket, name in ((None, "run.fit"), ("", "run.fit"), (" ", "run.fit"),
+                             (123, "run.fit"), ("user-bucket", None),
+                             ("user-bucket", ""), ("user-bucket", 123)):
+            cases.extend([{"bucket": bucket, "name": name}, self.pubsub(bucket, name)])
+        for event_type in ("OBJECT_DELETE", "OBJECT_METADATA_UPDATE", ""):
+            cases.extend([{"bucket": "user-bucket", "name": "run.fit", "eventType": event_type},
+                          self.pubsub(eventType=event_type)])
+        for data in cases:
+            with self.subTest(data=data), patch("main.storage.Client") as client, \
+                    patch("main.fitparse.FitFile") as parser, patch("builtins.print") as log:
+                process_fit_file(self.event(data))
+                client.assert_not_called()
+                parser.assert_not_called()
+                log.assert_called()
 
 
 class FitExtractionTest(unittest.TestCase):
