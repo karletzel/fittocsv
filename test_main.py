@@ -5,7 +5,7 @@ from datetime import datetime, timezone
 from decimal import Decimal
 from io import BytesIO
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pandas as pd
 import pyarrow.parquet as pq
@@ -37,6 +37,66 @@ def message(**values):
 
 
 class EventHandlerTest(unittest.TestCase):
+    def test_processing_failures_propagate_and_completion_requires_both_uploads(self):
+        for data in (
+            {"bucket": "user-bucket", "name": "RUN.FIT", "generation": "456"},
+            self.pubsub(),
+        ):
+            for failure_stage in (None, "download", "parse", "parquet", "verify", "data_upload", "metadata_upload"):
+                with self.subTest(data=data, failure_stage=failure_stage), \
+                        patch("main.storage.Client") as client, \
+                        patch("main.fitparse.FitFile") as parser, \
+                        patch("main.pd.DataFrame.to_parquet") as write_parquet, \
+                        patch("main.os.path.getsize", return_value=100), \
+                        patch("main.verify_data_parquet") as verify, \
+                        patch("builtins.print"), self.assertLogs("main", level="INFO") as logs:
+                    source_blob, data_blob, metadata_blob = MagicMock(), MagicMock(), MagicMock()
+                    client.return_value.bucket.return_value.blob.side_effect = [
+                        source_blob, data_blob, metadata_blob,
+                    ]
+                    source_blob.download_as_bytes.return_value = b"fit bytes"
+                    parser.return_value = FakeFitFile({"record": [message(
+                        timestamp=datetime(2026, 8, 15, tzinfo=timezone.utc), heart_rate=120,
+                    )]})
+                    # Each upload must finish before a completion log is emitted.
+                    def upload(_path):
+                        self.assertEqual(logs.records, [])
+                    data_blob.upload_from_filename.side_effect = upload
+                    metadata_blob.upload_from_filename.side_effect = upload
+                    failure = RuntimeError(f"failure at {failure_stage}")
+                    stages = {
+                        "download": source_blob.download_as_bytes,
+                        "parse": parser,
+                        "parquet": write_parquet,
+                        "verify": verify,
+                        "data_upload": data_blob.upload_from_filename,
+                        "metadata_upload": metadata_blob.upload_from_filename,
+                    }
+                    if failure_stage:
+                        stages[failure_stage].side_effect = failure
+                        with self.assertRaises(RuntimeError) as raised:
+                            process_fit_file(self.event(data))
+                        self.assertIs(raised.exception, failure)
+                        self.assertEqual(len(logs.records), 1)
+                        self.assertIs(logs.records[0].exc_info[1], failure)
+                        self.assertIsNotNone(logs.records[0].exc_info[2])
+                        self.assertIn("FIT processing failed", logs.output[0])
+                        if failure_stage == "data_upload":
+                            metadata_blob.upload_from_filename.assert_not_called()
+                        if failure_stage == "metadata_upload":
+                            data_blob.upload_from_filename.assert_called_once()
+                            metadata_blob.upload_from_filename.assert_called_once()
+                    else:
+                        self.assertIsNone(process_fit_file(self.event(data)))
+                        data_blob.upload_from_filename.assert_called_once()
+                        metadata_blob.upload_from_filename.assert_called_once()
+                        self.assertEqual(len(logs.records), 1)
+                        self.assertIn("FIT processing completed", logs.output[0])
+                    self.assertIn("bucket=user-bucket", logs.output[0])
+                    self.assertIn("source_file=RUN.FIT", logs.output[0])
+                    generation = "456" if "bucket" in data else "123"
+                    self.assertIn(f"generation={generation}", logs.output[0])
+
     @staticmethod
     def event(data):
         return CloudEvent({"type": "test.event", "source": "test"}, data)
