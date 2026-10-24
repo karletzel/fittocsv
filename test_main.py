@@ -37,12 +37,73 @@ def message(**values):
 
 
 class EventHandlerTest(unittest.TestCase):
+    def test_duplicate_detection_requires_both_outputs_with_matching_provenance(self):
+        provenance = {"source_bucket": "user-bucket", "source_file": "RUN.FIT",
+                      "source_generation": "123"}
+        def output(metadata):
+            return SimpleNamespace(metadata=metadata)
+
+        matching = output(provenance)
+        for direct in (True, False):
+            for scenario, existing, generation, skip in (
+                ("duplicate", [matching, matching], "123", True),
+                ("numeric generation", [matching, matching], 123, True),
+                ("missing data", [None, matching], "123", False),
+                ("missing metadata", [matching, None], "123", False),
+                ("both missing", [None, None], "123", False),
+                ("overwritten source", [matching, matching], "124", False),
+                ("mixed generations", [matching, output({**provenance, "source_generation": "122"})], "123", False),
+                ("legacy outputs", [output(None), output({})], "123", False),
+                ("different source", [matching, output({**provenance, "source_file": "RUN.fit"})], "123", False),
+                ("different bucket", [matching, output({**provenance, "source_bucket": "other-user"})], "123", False),
+                ("no generation", [matching, matching], None, False),
+            ):
+                with self.subTest(direct=direct, scenario=scenario), \
+                        patch("main.storage.Client") as client, \
+                        patch("main.fitparse.FitFile") as parser, \
+                        patch("main.pd.DataFrame.to_parquet"), \
+                        patch("main.os.path.getsize", return_value=100), \
+                        patch("main.verify_data_parquet"), patch("builtins.print"), \
+                        self.assertLogs("main", level="INFO") as logs:
+                    data = ({"bucket": "user-bucket", "name": "RUN.FIT", "generation": generation}
+                            if direct else self.pubsub(objectGeneration=generation))
+                    bucket = client.return_value.bucket.return_value
+                    bucket.get_blob.side_effect = existing
+                    blobs = {name: MagicMock() for name in (
+                        "RUN.FIT", "processed/data/RUN.parquet", "processed/metadata/RUN.parquet",
+                    )}
+                    bucket.blob.side_effect = lambda name, **kwargs: blobs[name]
+                    blobs["RUN.FIT"].download_as_bytes.return_value = b"fit bytes"
+                    parser.return_value = FakeFitFile({"record": [message(
+                        timestamp=datetime(2026, 8, 15, tzinfo=timezone.utc), heart_rate=120,
+                    )]})
+
+                    self.assertIsNone(process_fit_file(self.event(data)))
+
+                    if generation is not None:
+                        self.assertEqual([call.args[0] for call in bucket.get_blob.call_args_list],
+                                         ["processed/data/RUN.parquet", "processed/metadata/RUN.parquet"])
+                    else:
+                        bucket.get_blob.assert_not_called()
+                    if skip:
+                        parser.assert_not_called()
+                        bucket.blob.assert_not_called()
+                        self.assertIn("already processed", logs.output[0])
+                    else:
+                        parser.assert_called_once()
+                        source_call = bucket.blob.call_args_list[0]
+                        self.assertEqual(source_call.kwargs, {"generation": generation} if generation else {})
+                        for name in ("processed/data/RUN.parquet", "processed/metadata/RUN.parquet"):
+                            blobs[name].upload_from_filename.assert_called_once()
+                            expected = {**provenance, "source_generation": generation} if generation else {}
+                            self.assertEqual(blobs[name].metadata, expected)
+
     def test_processing_failures_propagate_and_completion_requires_both_uploads(self):
         for data in (
             {"bucket": "user-bucket", "name": "RUN.FIT", "generation": "456"},
             self.pubsub(),
         ):
-            for failure_stage in (None, "download", "parse", "parquet", "verify", "data_upload", "metadata_upload"):
+            for failure_stage in (None, "lookup", "download", "parse", "parquet", "verify", "data_upload", "metadata_upload"):
                 with self.subTest(data=data, failure_stage=failure_stage), \
                         patch("main.storage.Client") as client, \
                         patch("main.fitparse.FitFile") as parser, \
@@ -65,6 +126,7 @@ class EventHandlerTest(unittest.TestCase):
                     metadata_blob.upload_from_filename.side_effect = upload
                     failure = RuntimeError(f"failure at {failure_stage}")
                     stages = {
+                        "lookup": client.return_value.bucket.return_value.get_blob,
                         "download": source_blob.download_as_bytes,
                         "parse": parser,
                         "parquet": write_parquet,

@@ -255,7 +255,41 @@ def process_fit_file(cloud_event: CloudEvent):
         print("Source FIT object:", file_name)
         storage_client = storage.Client()
         bucket = storage_client.bucket(bucket_name)
-        file_content = bucket.blob(file_name).download_as_bytes()
+        output_filename = parquet_output_name(file_name)
+        data_output_name = f"processed/data/{output_filename}"
+        metadata_output_name = f"processed/metadata/{output_filename}"
+        provenance = {}
+        if object_generation is not None:
+            provenance = {
+                "source_bucket": bucket_name,
+                "source_file": file_name,
+                "source_generation": str(object_generation),
+            }
+            existing_outputs = [
+                bucket.get_blob(data_output_name),
+                bucket.get_blob(metadata_output_name),
+            ]
+            if all(
+                blob is not None
+                and all(
+                    (blob.metadata or {}).get(key) == value
+                    for key, value in provenance.items()
+                )
+                for blob in existing_outputs
+            ):
+                logger.info(
+                    "FIT file already processed: bucket=%s source_file=%s generation=%s",
+                    bucket_name, file_name, object_generation,
+                )
+                return
+
+        # Pin downloads to the notified version so newer bytes cannot be tagged
+        # as having come from an older generation.
+        source_blob = (
+            bucket.blob(file_name, generation=object_generation)
+            if object_generation is not None else bucket.blob(file_name)
+        )
+        file_content = source_blob.download_as_bytes()
         print("Downloaded FIT bytes:", len(file_content))
 
         fitfile = fitparse.FitFile(io.BytesIO(file_content))
@@ -273,7 +307,6 @@ def process_fit_file(cloud_event: CloudEvent):
         metadata_df = build_workout_metadata(
             fitfile, records, bucket_name, file_name, workout_id
         )
-        output_filename = parquet_output_name(file_name)
         local_data_path = os.path.join("/tmp", os.path.basename(output_filename))
         local_metadata_path = os.path.join("/tmp", f"metadata-{os.path.basename(output_filename)}")
         records_df.to_parquet(local_data_path, index=False)
@@ -281,8 +314,10 @@ def process_fit_file(cloud_event: CloudEvent):
         print("Local data Parquet bytes:", os.path.getsize(local_data_path))
         verify_data_parquet(local_data_path, len(records_df))
 
-        data_blob = bucket.blob(f"processed/data/{output_filename}")
-        metadata_blob = bucket.blob(f"processed/metadata/{output_filename}")
+        data_blob = bucket.blob(data_output_name)
+        metadata_blob = bucket.blob(metadata_output_name)
+        data_blob.metadata = provenance
+        metadata_blob.metadata = provenance
         print("Uploading time-series Parquet to:", data_blob.name)
         print("Uploading one-row metadata Parquet to:", metadata_blob.name)
         data_blob.upload_from_filename(local_data_path)
